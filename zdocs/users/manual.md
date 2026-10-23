@@ -80,6 +80,14 @@ Start the guest RTC on the given date, using the current local time of day. The 
 Advance the CPU timebase, decrementer, and device timers using elapsed host time, instead of instruction counts. This keeps double click delays, keyboard repeat, sleeps, and timeouts tied to wall time, improving usability of user interfaces. Control-Alt-R toggles this mode while running.
 
 ```
+--speed percent
+```
+
+Run the guest at `percent` percent of real time. The default is `100`, which keeps the guest's time of day clock, timers, video refresh and audio in step with the host. Use `--speed 0` to let the guest run as fast as the host allows, which is useful when the priority is to get through a long operation quickly. Control-Alt-S toggles the limit while running.
+
+The limit is not applied when `--realtime` is in effect, since that mode already derives guest time from the host clock, nor in deterministic mode.
+
+```
 --deterministic
 --deterministic-mode strict|interactive
 ```
@@ -226,6 +234,7 @@ You can use these keyboard commands while the emulator is running:
 * Control-L: log toggle
 * Control-D: debugger
 * Control-Alt-R: toggle realtime guest timing
+* Control-Alt-S: toggle limiting the guest to real time speed
 
 ## Accessing Open Firmware
 

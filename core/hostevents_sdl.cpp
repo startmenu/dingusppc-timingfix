@@ -168,6 +168,18 @@ void EventManager::poll_events() {
                     return;
                 }
 
+                // Control-Alt-S: toggle limiting the guest to real time speed
+                if (event.key.keysym.sym == SDLK_s && (event.key.keysym.mod & KMOD_ALL) == (KMOD_LCTRL | KMOD_LALT)) {
+                    if (event.type == SDL_KEYUP) {
+                        uint32_t speed_percent = toggle_speed_limit();
+                        if (speed_percent)
+                            LOG_F(INFO, "speed limited to %u%% of real time", speed_percent);
+                        else
+                            LOG_F(INFO, "speed not limited");
+                    }
+                    return;
+                }
+
                 // Control-L: log toggle
                 if (event.key.keysym.sym == SDLK_l && (event.key.keysym.mod & KMOD_ALL) == KMOD_LCTRL) {
                     if (event.type == SDL_KEYUP) {

@@ -181,6 +181,9 @@ int main(int argc, char** argv) {
         ->check(CLI::ExistingFile)->capture_default_str();
     emu->add_flag("--realtime", g_realtime,
         "Advance guest timers using the host clock");
+    emu->add_option("--speed", g_speed_percent,
+        "Limit the guest to this percentage of real time (0 = as fast as possible)")
+        ->check(CLI::Range(0, 1000))->capture_default_str();
     auto deterministic_opt = emu->add_flag("--deterministic", is_deterministic,
         "Use deterministic execution");
     emu->add_option("--start-date", start_date,
@@ -335,6 +338,12 @@ int main(int argc, char** argv) {
     cout << "Execution mode: " << execution_mode << endl;
     if (g_realtime)
         cout << "Guest timers use the host clock." << endl;
+    else if (is_deterministic)
+        cout << "Guest speed not limited (deterministic execution)." << endl;
+    else if (g_speed_percent)
+        cout << "Guest speed limited to " << g_speed_percent << "% of real time." << endl;
+    else
+        cout << "Guest speed not limited, running as fast as possible." << endl;
     if (is_deterministic) {
         cout << "Using deterministic execution mode; disk, NVRAM, and PRAM changes will not be saved." << endl;
         if (deterministic_interactive) {

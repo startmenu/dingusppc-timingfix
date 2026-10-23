@@ -738,6 +738,13 @@ extern int get_icnt_factor();
 extern bool g_realtime;
 extern bool toggle_g_realtime();
 
+/* guest speed control: emulated speed as a percentage of real time,
+   0 means "run as fast as the host allows" */
+extern uint32_t g_speed_percent;
+extern uint32_t get_speed_percent();
+extern uint32_t set_speed_percent(uint32_t percent);
+extern uint32_t toggle_speed_limit();
+
 /* force_cycle_counter_reload */
 static void force_cycle_counter_reload();
 

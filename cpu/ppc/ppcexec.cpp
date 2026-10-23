@@ -34,6 +34,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <stdexcept>
 #include <stdio.h>
 #include <string>
+#include <thread>
 
 #ifdef __APPLE__
 #include <ctime>
@@ -120,6 +121,7 @@ bool thrm_exception_pending = false;
 
 /* variables related to virtual time */
 bool g_realtime = false;
+uint32_t g_speed_percent = 100; // 0 = no limit, 100 = real time
 uint64_t g_nanoseconds_base;
 uint64_t g_icycles;
 int      icnt_factor;
@@ -361,6 +363,8 @@ uint64_t get_virt_time_ns()
     }
 }
 
+static void pacing_reset(uint64_t virt_now);
+
 void set_virt_time_ns(uint64_t time_now)
 {
     if (g_realtime) {
@@ -373,7 +377,131 @@ void set_virt_time_ns(uint64_t time_now)
         g_nanoseconds_base += 2 * (time_new - time_now);
         time_new = get_virt_time_ns();
     }
+    // the virtual timeline was moved on purpose; don't try to catch up with it
+    pacing_reset(time_new);
     LOG_F(INFO, "time before: %lld  after: %lld  change: %lld", time_now, time_new, time_new - time_now);
+}
+
+/*
+    Virtual time pacing.
+
+    Guest time is derived from the instruction counter (one instruction takes
+    2^icnt_factor ns, see ppc_cpu_init below), so it is completely independent
+    of how fast the host actually runs the interpreter. A host that executes
+    the interpreter faster than the modelled CPU therefore makes the guest's
+    time of day clock, timers, audio and video all run too fast, because their
+    notion of "now" advances faster than real time.
+
+    pace_virtual_time() delays the interpreter so that virtual time never
+    advances faster than g_speed_percent of real time. The delay is inserted on
+    the host side only, so the amount of virtual time attributed to one
+    instruction is unchanged. Firmware that derives the CPU clock from
+    instruction timing (for example the 'mach' gestalt calculation of the Power
+    Mac 6100) therefore keeps seeing the correct clock, and machines that
+    require icnt_factor to stay within a range still boot.
+
+    Use g_speed_percent = 0 to run as fast as the host allows (old behavior).
+*/
+
+// Small deficits are allowed to accumulate instead of being slept off right
+// away. Grouping the delays into fewer, longer sleeps keeps the syscall
+// overhead low and stays well below one video frame of jitter.
+static constexpr uint64_t PACING_MIN_AHEAD_NS = 200'000;    // 200 us
+// Re-anchor when the guest falls this far behind the schedule. Short stalls
+// (disk access, rendering, a slow host) are repaid by running without idling
+// until the schedule is reached again; only a longer interruption is treated
+// as a resynchronization.
+static constexpr uint64_t PACING_MAX_LAG_NS   = 50'000'000; // 50 ms
+// Never block the interpreter for longer than this in one go. A larger debt
+// means the timeline was moved and should be re-anchored instead.
+static constexpr uint64_t PACING_MAX_SLEEP_NS = 25'000'000; // 25 ms
+// Long waits are taken in slices of at most this length so that devices which
+// are driven from other threads (e.g. the sound server) don't have to wait for
+// the full delay before the interpreter looks at the timer queue again.
+static constexpr uint64_t PACING_SLEEP_SLICE_NS = 1'000'000; // 1 ms
+// Print timing statistics (host clock versus virtual clock) this often.
+static constexpr uint64_t PACING_STATS_INTERVAL_NS = 10'000'000'000ULL; // 10 s
+
+// Host time at which the virtual time g_pace_virt_ns is due. The two values
+// form an absolute schedule, so a sleep that returns late is automatically
+// compensated by the next batch instead of being lost.
+static uint64_t g_pace_host_ns;
+static uint64_t g_pace_virt_ns;
+
+// statistics
+static uint64_t g_pace_stats_host_ns;
+static uint64_t g_pace_stats_virt_ns;
+static uint64_t g_pace_stats_sleep_ns;
+static uint64_t g_pace_stats_resync;
+
+static void pacing_reset(uint64_t virt_now)
+{
+    g_pace_virt_ns = virt_now;
+    g_pace_host_ns = cpu_now_ns();
+    g_pace_stats_resync++;
+}
+
+static void pace_virtual_time()
+{
+#if defined(__EMSCRIPTEN__)
+    // Blocking the interpreter would stall the browser's event loop, so leave
+    // pacing to the environment the emulator runs in.
+    return;
+#else
+    const uint64_t virt_now = get_virt_time_ns();
+    const uint64_t host_now = cpu_now_ns();
+
+    if (host_now - g_pace_stats_host_ns >= PACING_STATS_INTERVAL_NS) {
+        const uint64_t host_elapsed = host_now - g_pace_stats_host_ns;
+        const uint64_t virt_elapsed = virt_now >= g_pace_stats_virt_ns ?
+            virt_now - g_pace_stats_virt_ns : 0;
+        LOG_F(1, "timing: %llu ms virtual in %llu ms real (%llu%%), %llu ms idle, %llu resync",
+            virt_elapsed / NS_PER_MSEC, host_elapsed / NS_PER_MSEC,
+            virt_elapsed * 100 / host_elapsed, g_pace_stats_sleep_ns / NS_PER_MSEC,
+            g_pace_stats_resync);
+        g_pace_stats_host_ns = host_now;
+        g_pace_stats_virt_ns = virt_now;
+        g_pace_stats_sleep_ns = 0;
+        g_pace_stats_resync = 0;
+    }
+
+    if (!g_speed_percent || g_realtime || is_deterministic) {
+        return;
+    }
+
+    // host time at which the current virtual time is due
+    const uint64_t target_host = g_pace_host_ns +
+        ((virt_now >= g_pace_virt_ns ? virt_now - g_pace_virt_ns : 0) * 100 / g_speed_percent);
+
+    if (host_now >= target_host) {
+        // guest is at or behind real time; nothing to do unless it lost track
+        if (host_now - target_host > PACING_MAX_LAG_NS) {
+            pacing_reset(virt_now);
+        }
+    } else {
+        uint64_t wait_ns = target_host - host_now;
+        if (wait_ns > PACING_MAX_SLEEP_NS) {
+            // don't try to catch up with a timeline that was moved far ahead
+            pacing_reset(virt_now);
+        } else if (wait_ns >= PACING_MIN_AHEAD_NS) {
+            const uint64_t deadline = host_now + wait_ns;
+            for (;;) {
+                const uint64_t now = cpu_now_ns();
+                // A device serviced from another thread asked for attention;
+                // hand the interpreter back so the timer queue is processed.
+                if (now >= deadline || exec_timer) {
+                    g_pace_stats_sleep_ns += now - host_now;
+                    break;
+                }
+                uint64_t remain = deadline - now;
+                if (remain > PACING_SLEEP_SLICE_NS) {
+                    remain = PACING_SLEEP_SLICE_NS;
+                }
+                std::this_thread::sleep_for(std::chrono::nanoseconds(remain));
+            }
+        }
+    }
+#endif
 }
 
 static constexpr uint64_t TIMER_POLL_INTERVAL_NS = 500'000;
@@ -381,6 +509,7 @@ static constexpr uint64_t TIMER_POLL_INTERVAL_NS = 500'000;
 static uint64_t process_events()
 {
     exec_timer = false;
+    pace_virtual_time();
     uint64_t next_ns = TimerManager::get_instance()->process_timers();
     if (g_realtime) {
         uint64_t time_now = get_virt_time_ns();
@@ -444,6 +573,32 @@ bool toggle_g_realtime()
     set_virt_time_ns(time_now);
     force_cycle_counter_reload();
     return g_realtime;
+}
+
+/* speed control */
+
+static uint32_t g_speed_percent_saved = 100;
+
+uint32_t get_speed_percent()
+{
+    return g_speed_percent;
+}
+
+uint32_t set_speed_percent(uint32_t percent)
+{
+    g_speed_percent = percent;
+    pacing_reset(get_virt_time_ns());
+    force_cycle_counter_reload();
+    return g_speed_percent;
+}
+
+uint32_t toggle_speed_limit()
+{
+    if (g_speed_percent) {
+        g_speed_percent_saved = g_speed_percent;
+        return set_speed_percent(0);
+    }
+    return set_speed_percent(g_speed_percent_saved);
 }
 
 typedef enum {
@@ -1054,6 +1209,13 @@ void ppc_cpu_init(MemCtrlBase* mem_ctrl, uint32_t cpu_version, bool do_include_6
     // initialize time base facility
     g_nanoseconds_base = cpu_now_ns();
     g_icycles = 0;
+
+    // start pacing the virtual timeline against the host clock
+    pacing_reset(0);
+    g_pace_stats_host_ns = g_pace_host_ns;
+    g_pace_stats_virt_ns = 0;
+    g_pace_stats_sleep_ns = 0;
+    g_pace_stats_resync = 0;
 
 //                    //                                        // PDM cpu clock calculated at 0x403036CC in r3
 //  icnt_factor = 11; // 1 instruction = 2048 ns =    0.488 MHz // 00068034 =     0.426036 MHz = 2347.219 ns // floppy doesn't work
