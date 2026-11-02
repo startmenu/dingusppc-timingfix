@@ -58,7 +58,15 @@ PlatinumCtrl::PlatinumCtrl() : MemCtrlBase(), VideoCtrlBase() {
 
     // initialize the CPUID register with the following CPU:
     // PowerPC 601 @ 90 MHz, bus frequency: 45 MHz
-    this->cpu_id = (0x3001 << 16) | ClkSrc2 | (CpuSpeed2::CPU_90_BUS_45 << 8);
+    this->cpu_id =
+        ( 0x3 << 28) | // Design Center: 3 = High-End RISC Design Center
+        (   0 << 24) | // Upper ID: 0 = machine with registers wider than 8-bit
+        (0x01 << 16) | // Lower ID: 1 = Platinum-based machine
+        ClkSrc2      | // Clock Source: bits 15 and 6
+        (   0 << 12) | // Motherboard ID: Catalyst motherboard with 1 MB of VRAM
+        (CpuSpeed2::CPU_90_BUS_45 << 8)
+                     | // System/CPU Speed
+        (   0 <<  7) ; // CPU Type: 0 = 601, 1 = 603/604
 
     this->display_id = std::unique_ptr<DisplayID> (new DisplayID());
 
@@ -124,7 +132,7 @@ uint32_t PlatinumCtrl::read(uint32_t rgn_start, uint32_t offset, int size) {
             return read_mem(&this->vram_ptr[offset], size);
         } else {
             LOG_F(WARNING, "%s: read from unmapped aperture address 0x%X",
-                  this->name.c_str(), this->fb_addr + offset);
+                  this->name.c_str(), VRAM_REGION_BASE + offset);
             return (uint32_t)-1;
         }
     }
@@ -230,7 +238,7 @@ void PlatinumCtrl::write(uint32_t rgn_start, uint32_t offset, uint32_t value, in
             write_mem(&this->vram_ptr[offset], value, size);
         } else
             LOG_F(WARNING, "%s: write to unmapped aperture address 0x%X",
-                  this->name.c_str(), this->fb_addr + offset);
+                  this->name.c_str(), VRAM_REGION_BASE + offset);
         return;
     }
 
@@ -239,10 +247,10 @@ void PlatinumCtrl::write(uint32_t rgn_start, uint32_t offset, uint32_t value, in
         this->rom_timing = value;
         break;
     case PlatinumReg::DRAM_TIMING:
-        this->dram_timing = value;
+        this->dram_timing = value & 0x1FFF;
         break;
     case PlatinumReg::DRAM_REFRESH:
-        this->dram_refresh = value;
+        this->dram_refresh = value & 0x7FF;
         break;
     case PlatinumReg::BANK_0_BASE:
     case PlatinumReg::BANK_1_BASE:
@@ -252,7 +260,7 @@ void PlatinumCtrl::write(uint32_t rgn_start, uint32_t offset, uint32_t value, in
     case PlatinumReg::BANK_5_BASE:
     case PlatinumReg::BANK_6_BASE:
     case PlatinumReg::BANK_7_BASE:
-        this->bank_base[(offset >> 4) - PlatinumReg::BANK_0_BASE] = value;
+        this->bank_base[(offset >> 4) - PlatinumReg::BANK_0_BASE] = value & 0xFF700000U;
         this->map_phys_ram();
         break;
     case PlatinumReg::FB_BASE_ADDR:
@@ -263,11 +271,11 @@ void PlatinumCtrl::write(uint32_t rgn_start, uint32_t offset, uint32_t value, in
         }
         break;
     case PlatinumReg::ROW_WORDS:
-        this->row_words = value & ~7;
+        this->row_words = value & 0x7FF8;
         this->change_display();
         break;
     case PlatinumReg::CLOCK_DIVISOR:
-        this->clock_divisor = value;
+        this->clock_divisor = value & 0xFFU;
         this->change_display();
         break;
     case PlatinumReg::FB_CONFIG_1:
@@ -278,10 +286,10 @@ void PlatinumCtrl::write(uint32_t rgn_start, uint32_t offset, uint32_t value, in
         this->half_bank = !!(this->vram_megs == 1 && (value & CFG1_FULL_BANKS));
         break;
     case PlatinumReg::FB_CONFIG_2:
-        this->fb_config_2 = value;
+        this->fb_config_2 = value & 0x1FFF;
         break;
     case PlatinumReg::VMEM_PAGE_MODE:
-        this->vmem_fp_mode = value;
+        this->vmem_fp_mode = value & 1;
         break;
     case PlatinumReg::MON_ID_SENSE:
         value &= 7;
@@ -292,6 +300,7 @@ void PlatinumCtrl::write(uint32_t rgn_start, uint32_t offset, uint32_t value, in
             (this->display_id->read_monitor_sense(mon_levels, mon_dirs) ^ 7);
         break;
     case PlatinumReg::FB_RESET:
+        value &= 7;
         if (value == 7 && this->crtc_on) {
             LOG_F(INFO, "%s: video disabled", this->name.c_str());
             this->reset_step = 0;
@@ -327,10 +336,10 @@ void PlatinumCtrl::write(uint32_t rgn_start, uint32_t offset, uint32_t value, in
             (value         &  (SENSE_LINE_OUTPUT_DATA | SYNCS_OUTPUT_ENABLE | FORCED_SYNC_LEVELS));
         break;
     case PlatinumReg::VRAM_REFRESH:
-        this->vram_refresh = value;
+        this->vram_refresh = value & 0x7FF;
         break;
     case PlatinumReg::SWATCH_CONFIG:
-        this->swatch_config = value;
+        this->swatch_config = (this->swatch_config & ~0xFFU) | (value & 0xFFU);
         break;
     case PlatinumReg::SWATCH_INT_MASK:
         this->swatch_int_mask = value;
@@ -338,7 +347,7 @@ void PlatinumCtrl::write(uint32_t rgn_start, uint32_t offset, uint32_t value, in
             LOG_F(INFO, "%s: VBL interrupt enabled", this->name.c_str());
         break;
     case PlatinumReg::CURSOR_LINE:
-        this->cursor_line = value;
+        this->cursor_line = value & 0x7FF;
         if (this->swatch_int_mask & SWATCH_INT_CURSOR)
             this->enable_cursor_int();
         break;
@@ -351,7 +360,6 @@ void PlatinumCtrl::write(uint32_t rgn_start, uint32_t offset, uint32_t value, in
         //break;
     case PlatinumReg::SWATCH_HSERR:
     case PlatinumReg::SWATCH_HLFLN:
-    case PlatinumReg::SWATCH_HEQ:
     case PlatinumReg::SWATCH_HSP:
     case PlatinumReg::SWATCH_HBWAY:
     case PlatinumReg::SWATCH_HBRST:
@@ -366,11 +374,15 @@ void PlatinumCtrl::write(uint32_t rgn_start, uint32_t offset, uint32_t value, in
     case PlatinumReg::SWATCH_VAL:
     case PlatinumReg::SWATCH_VFP:
     case PlatinumReg::SWATCH_VFPEQ:
-        this->swatch_params[REG_TO_INDEX(offset >> 4)] = value;
+        this->swatch_params[REG_TO_INDEX(offset >> 4)] = value & 0xFFF;
+        this->change_display();
+        break;
+    case PlatinumReg::SWATCH_HEQ:
+        this->swatch_params[REG_TO_INDEX(offset >> 4)] = value & 0xFF;
         this->change_display();
         break;
     case PlatinumReg::TIMING_ADJUST:
-        this->timing_adjust = value;
+        this->timing_adjust = value & 0xFFF;
         break;
     case PlatinumReg::IRIDIUM_CONFIG:
         if (!(value & 1))
@@ -629,7 +641,7 @@ void PlatinumCtrl::update_irq(uint8_t irq_line_state, uint8_t irq_mask) {
 // ========================== Device registry stuff ==========================
 static const PropMap Platinum_Properties = {
     {"gfxmem_size",
-        new IntProperty(1, std::vector<uint32_t>({1, 2, 4}))},
+        new IntProperty(4, std::vector<uint32_t>({1, 2, 4}))},
     {"mon_id",
         new StrProperty("HiRes12-14in")},
 };
